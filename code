@@ -2,8 +2,6 @@
 """
 channel_yield.py
 
-Demonstration of "Maximizing Channel Yield in Digital Transaction" workflow.
-
 Features:
 - Build period graph from session/page logs
 - Compute conversion/yield and per-edge leakage
@@ -12,7 +10,7 @@ Features:
 - Small visual helper to draw the graph (matplotlib)
 
 Author: Sanket Jain (demo)
-Publication concept: 20220020034 (idea demonstration only)
+
 """
 
 from dataclasses import dataclass, field
