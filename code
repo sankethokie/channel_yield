@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+channel_yield.py
+
+Demonstration of "Maximizing Channel Yield in Digital Transaction" workflow.
+
+Features:
+- Build period graph from session/page logs
+- Compute conversion/yield and per-edge leakage
+- Maintain temporal reference (baseline) and update via exponential smoothing
+- Identify top leakage edges and where they lead
+- Small visual helper to draw the graph (matplotlib)
+
+Author: Sanket Jain (demo)
+Publication concept: 20220020034 (idea demonstration only)
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional
+import pandas as pd
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from collections import defaultdict, Counter
+import datetime
+
+
+# -------------------------
+# Utilities & Data classes
+# -------------------------
+@dataclass
+class EdgeStats:
+    count: int = 0               # transitions on this edge in the period
+    drop_count: int = 0          # number of sessions which dropped after this node (no next)
+    from_node: str = ""
+    to_node: str = ""
+
+    def to_dict(self):
+        return {"count": self.count, "drop_count": self.drop_count, "from": self.from_node, "to": self.to_node}
+
+
+@dataclass
+class PeriodGraph:
+    G: nx.DiGraph = field(default_factory=nx.DiGraph)
+    period_start: Optional[pd.Timestamp] = None
+    period_end: Optional[pd.Timestamp] = None
+
+    def add_edge_stats(self, u: str, v: str, count: int):
+        if not self.G.has_edge(u, v):
+            self.G.add_edge(u, v, count=0)
+        self.G[u][v]["count"] += int(count)
+
+    def set_node_drop(self, node: str, drop_count: int):
+        # store drop_count as node attr
+        prev = self.G.nodes[node].get("drop_count", 0)
+        self.G.nodes[node]["drop_count"] = prev + int(drop_count)
+
+    def get_edge_count(self, u: str, v: str) -> int:
+        return int(self.G[u][v].get("count", 0))
+
+    def iter_edges(self):
+        return self.G.edges(data=True)
+
+    def iter_nodes(self):
+        return self.G.nodes(data=True)
+
+
+# -------------------------
+# Core functions
+# -------------------------
+def build_period_graph_from_sessions(df: pd.DataFrame,
+                                     session_col: str = "session_id",
+                                     time_col: str = "timestamp",
+                                     page_col: str = "page",
+                                     period_start: Optional[str] = None,
+                                     period_end: Optional[str] = None) -> PeriodGraph:
+    """
+    Build a directed period graph from session logs.
+
+    df: DataFrame with at least [session_id, timestamp, page]
+    period_start, period_end: optional ISO strings to filter timeframe (inclusive)
+    """
+    # validate
+    df = df.copy()
+    if not np.issubdtype(df[time_col].dtype, np.datetime64):
+        df[time_col] = pd.to_datetime(df[time_col])
+
+    if period_start:
+        df = df[df[time_col] >= pd.to_datetime(period_start)]
+    if period_end:
+        df = df[df[time_col] <= pd.to_datetime(period_end)]
+
+    # sort by session and time
+    df = df.sort_values([session_col, time_col])
+    # compute transitions
+    edge_counts = Counter()
+    node_drop_counts = Counter()
+    node_visit_counts = Counter()
+
+    for sid, group in df.groupby(session_col):
+        pages = list(group[page_col].astype(str))
+        node_visit_counts.update(pages)
+        if len(pages) == 0:
+            continue
+        # transitions
+        for i in range(len(pages) - 1):
+            u = pages[i]
+            v = pages[i + 1]
+            edge_counts[(u, v)] += 1
+        # if session ended on last node, count as drop at last node
+        last_node = pages[-1]
+        node_drop_counts[last_node] += 1
+
+    pg = PeriodGraph()
+    # add nodes (ensures nodes exist even if no outgoing edge in this period)
+    for node in node_visit_counts:
+        pg.G.add_node(node, visits=int(node_visit_counts[node]), drop_count=int(node_drop_counts.get(node, 0)))
+
+    # add edges
+    for (u, v), cnt in edge_counts.items():
+        pg.add_edge_stats(u, v, cnt)
+
+    # period boundaries (if provided)
+    if period_start:
+        pg.period_start = pd.to_datetime(period_start)
+    if period_end:
+        pg.period_end = pd.to_datetime(period_end)
+
+    return pg
+
+
+def compute_yield_and_leakage(pg: PeriodGraph,
+                              conversion_nodes: Optional[List[str]] = None) -> PeriodGraph:
+    """
+    Compute the yield (probability of reaching conversion) and leakage for edges.
+
+    conversion_nodes: list of nodes considered 'conversion' or final success (e.g., 'payment_complete').
+    If not specified, we will treat any node with no outgoing edges (sink) as potential drop or conversion depending on context.
+    """
+    G = pg.G
+    # compute total sessions starting points per node: approximate via incoming + visits
+    # For yield, we'll compute for each node the fraction of sessions visiting this node that eventually reach conversion_nodes.
+    if conversion_nodes is None:
+        # treat nodes with "conversion" or "complete" in name as conversions if present
+        conversion_nodes = [n for n in G.nodes if ("complete" in n.lower() or "success" in n.lower() or "paid" in n.lower())]
+    conversion_set = set(conversion_nodes)
+
+    # Precompute reachability: for each node, compute number of paths reaching conversion weighted by transition counts.
+    # We'll perform a simple dynamic programming: topological order isn't guaranteed (cycles) -> use power-iteration style propagation.
+    # Initialize conversion_value[node] as 1.0 if node is conversion else 0.0, then propagate backwards using normalized transition probabilities.
+    nodes = list(G.nodes)
+    # Build adjacency matrix probabilities (outgoing)
+    out_prob = {n: {} for n in nodes}
+    for u, v, data in G.edges(data=True):
+        cnt = data.get("count", 0)
+        out_prob[u][v] = cnt
+
+    # normalize
+    for u in out_prob:
+        total = sum(out_prob[u].values()) if out_prob[u] else 0
+        if total > 0:
+            for v in out_prob[u]:
+                out_prob[u][v] = out_prob[u][v] / total
+        else:
+            out_prob[u] = {}
+
+    # initialize conversion_value
+    conv_val = {n: (1.0 if n in conversion_set else 0.0) for n in nodes}
+    # propagate backward by power iteration on reversed graph
+    # fixed number of iterations for stability
+    for _ in range(50):
+        new_conv = conv_val.copy()
+        for u in nodes:
+            if u in conversion_set:
+                new_conv[u] = 1.0
+            else:
+                # expected conversion probability starting from u = sum_v P(u->v) * conv_val[v]
+                s = 0.0
+                for v, p in out_prob.get(u, {}).items():
+                    s += p * conv_val.get(v, 0.0)
+                new_conv[u] = s
+        # check convergence (optional)
+        delta = max(abs(new_conv[n] - conv_val[n]) for n in nodes)
+        conv_val = new_conv
+        if delta < 1e-6:
+            break
+
+    # assign node conversion probability
+    for n in nodes:
+        G.nodes[n]["conv_prob"] = float(conv_val.get(n, 0.0))
+        G.nodes[n]["visits"] = int(G.nodes[n].get("visits", 0))
+        G.nodes[n]["drop_count"] = int(G.nodes[n].get("drop_count", 0))
+
+    # compute per-edge leakage: how many sessions 'lost' when taking edge u->v vs alternative paths.
+    # Define leakage for edge (u->v) as: proportion of sessions at u that, after taking u->v, do NOT convert
+    # i.e., leakage_edge = 1 - conv_prob[v]
+    for u, v, data in G.edges(data=True):
+        conv_v = G.nodes[v].get("conv_prob", 0.0)
+        data["conv_prob_to"] = float(conv_v)
+        data["leakage"] = float(1.0 - conv_v)  # higher = worse
+        data["count"] = int(data.get("count", 0))
+        # also compute loss = count * leakage to rank absolute impact
+        data["loss_estimate"] = data["count"] * data["leakage"]
+
+    return pg
+
+
+def temporal_update_reference(previous: PeriodGraph, current: PeriodGraph, alpha: float = 0.3) -> PeriodGraph:
+    """
+    Update a temporal reference graph using exponential smoothing between previous and current period graphs.
+
+    alpha: weight applied to current period (0..1). Higher alpha -> current period more influential.
+    This returns a new PeriodGraph representing the smoothed reference.
+    """
+    ref = PeriodGraph()
+    # union of nodes
+    nodes = set(previous.G.nodes).union(set(current.G.nodes))
+    for n in nodes:
+        prev_visits = int(previous.G.nodes[n].get("visits", 0)) if previous.G.has_node(n) else 0
+        curr_visits = int(current.G.nodes[n].get("visits", 0)) if current.G.has_node(n) else 0
+        sm_visits = int(round((1 - alpha) * prev_visits + alpha * curr_visits))
+        ref.G.add_node(n, visits=sm_visits,
+                       drop_count=int(round((1 - alpha) * previous.G.nodes[n].get("drop_count", 0) if previous.G.has_node(n) else 0
+                                           + alpha * current.G.nodes[n].get("drop_count", 0) if current.G.has_node(n) else 0)))
+    # union of edges
+    edges = set(previous.G.edges).union(set(current.G.edges))
+    for (u, v) in edges:
+        prev_cnt = int(previous.G[u][v].get("count", 0)) if previous.G.has_edge(u, v) else 0
+        curr_cnt = int(current.G[u][v].get("count", 0)) if current.G.has_edge(u, v) else 0
+        sm_cnt = int(round((1 - alpha) * prev_cnt + alpha * curr_cnt))
+        if sm_cnt > 0:
+            ref.add_edge_stats(u, v, sm_cnt)
+    # copy period boundaries
+    ref.period_start = previous.period_start or current.period_start
+    ref.period_end = current.period_end or previous.period_end
+    return ref
+
+
+def identify_high_leakage_edges(pg: PeriodGraph, top_k: int = 10, min_count: int = 1) -> List[Tuple[str, str, Dict]]:
+    """
+    Return top_k edges sorted by loss_estimate (count * leakage) descending.
+    """
+    edges = []
+    for u, v, data in pg.iter_edges():
+        cnt = int(data.get("count", 0))
+        if cnt < min_count:
+            continue
+        leakage = float(data.get("leakage", 0.0))
+        loss = float(data.get("loss_estimate", 0.0))
+        edges.append((u, v, {"count": cnt, "leakage": leakage, "loss_estimate": loss, "to_conv_prob": data.get("conv_prob_to", None)}))
+    edges_sorted = sorted(edges, key=lambda x: x[2]["loss_estimate"], reverse=True)
+    return edges_sorted[:top_k]
+
+
+# -------------------------
+# Visualization helpers
+# -------------------------
+def plot_graph_leakage(pg: PeriodGraph, top_n_edges: int = 20, figsize=(12, 8)):
+    G = pg.G
+    pos = nx.spring_layout(G, seed=42)
+    plt.figure(figsize=figsize)
+    # node sizes by visits
+    visits = np.array([G.nodes[n].get("visits", 1) for n in G.nodes()])
+    node_size = 300 + (visits / max(1, visits.max())) * 1200
+    nx.draw_networkx_nodes(G, pos, node_size=node_size, node_color="lightblue")
+    # draw top edges by loss
+    edges_with_loss = []
+    for u, v, data in G.edges(data=True):
+        edges_with_loss.append((u, v, data.get("loss_estimate", 0.0)))
+    edges_with_loss.sort(key=lambda x: x[2], reverse=True)
+    top_edges = edges_with_loss[:top_n_edges]
+    # width scaled by loss
+    widths = [max(0.5, min(8, 0.02 * e[2])) for e in top_edges]
+    nx.draw_networkx_edges(G, pos, edgelist=[(u, v) for u, v, _ in top_edges], width=widths, arrowstyle='-|>', arrowsize=12, edge_color='red')
+    nx.draw_networkx_labels(G, pos, font_size=9)
+    plt.title(f"Period Graph (highlight top {len(top_edges)} leakage edges)")
+    plt.axis('off')
+    plt.show()
+
+
+# -------------------------
+# Example / Demo
+# -------------------------
+def synthetic_session_data(num_sessions: int = 2000, seed: int = 42) -> pd.DataFrame:
+    """
+    Produce synthetic session logs for demo.
+    Pages: home -> search -> item -> add_to_cart -> checkout -> payment_success
+            with branches to support, help, exit
+    """
+    np.random.seed(seed)
+    pages = ["home", "search", "item", "add_to_cart", "checkout", "payment_success", "support", "help", "exit"]
+    transitions = {
+        "home": (["search", "item", "exit"], [0.6, 0.3, 0.1]),
+        "search": (["item", "home", "exit"], [0.7, 0.2, 0.1]),
+        "item": (["add_to_cart", "search", "exit"], [0.5, 0.3, 0.2]),
+        "add_to_cart": (["checkout", "item", "exit"], [0.6, 0.2, 0.2]),
+        "checkout": (["payment_success", "support", "exit"], [0.7, 0.1, 0.2]),
+        "support": (["home", "exit"], [0.5, 0.5]),
+        "help": (["home", "exit"], [0.5, 0.5]),
+        "exit": ([], [])
+    }
+    rows = []
+    for sid in range(num_sessions):
+        t = pd.Timestamp("2025-01-01") + pd.Timedelta(seconds=np.random.randint(0, 3600 * 24))
+        # simulate session length via Markov chain
+        cur = "home"
+        rows.append({"session_id": f"s{sid}", "timestamp": t, "page": cur})
+        steps = 0
+        while steps < 10:
+            steps += 1
+            choices, probs = transitions[cur]
+            if not choices:
+                break
+            nxt = np.random.choice(choices, p=probs)
+            # small chance to jump to support/help for some sessions to create interesting leakage
+            t = t + pd.Timedelta(seconds=np.random.randint(5, 120))
+            rows.append({"session_id": f"s{sid}", "timestamp": t, "page": nxt})
+            cur = nxt
+            if cur == "exit" or cur == "payment_success":
+                break
+    df = pd.DataFrame(rows)
+    return df
+
+
+def demo_pipeline():
+    # 1) synth data for two consecutive periods
+    df_all = synthetic_session_data(num_sessions=2500)
+    # split into two days to simulate previous and current period
+    df_prev = df_all[df_all["timestamp"] < pd.Timestamp("2025-01-01 12:00:00")]
+    df_curr = df_all[df_all["timestamp"] >= pd.Timestamp("2025-01-01 12:00:00")]
+
+    # 2) build period graphs
+    pg_prev = build_period_graph_from_sessions(df_prev, period_start="2025-01-01 00:00:00", period_end="2025-01-01 11:59:59")
+    pg_curr = build_period_graph_from_sessions(df_curr, period_start="2025-01-01 12:00:00", period_end="2025-01-01 23:59:59")
+
+    # 3) compute yield/leakage for both
+    pg_prev = compute_yield_and_leakage(pg_prev, conversion_nodes=["payment_success"])
+    pg_curr = compute_yield_and_leakage(pg_curr, conversion_nodes=["payment_success"])
+
+    # 4) create temporal reference by smoothing previous & current (alpha controls responsiveness)
+    ref = temporal_update_reference(pg_prev, pg_curr, alpha=0.4)
+    ref = compute_yield_and_leakage(ref, conversion_nodes=["payment_success"])
+
+    # 5) identify high leakage edges in current period
+    top_leaks = identify_high_leakage_edges(pg_curr, top_k=10, min_count=5)
+
+    print("Top leakage edges in CURRENT period:")
+    for u, v, data in top_leaks:
+        print(f" {u} -> {v} | count={data['count']} | leakage={data['leakage']:.3f} | loss_est={data['loss_estimate']:.1f} | conv_prob_to={data['to_conv_prob']:.3f}")
+
+    # 6) compare to reference to detect newly introduced leakage
+    # find edges where current loss_estimate significantly > ref.loss_estimate
+    new_issues = []
+    for u, v, d in top_leaks:
+        curr_loss = d["loss_estimate"]
+        ref_loss = 0.0
+        if ref.G.has_edge(u, v):
+            ref_loss = ref.G[u][v].get("loss_estimate", 0.0)
+        # relative increase
+        rel_increase = (curr_loss - ref_loss) / (ref_loss + 1e-6)
+        if rel_increase > 0.5:  # >50% increase vs reference
+            new_issues.append((u, v, curr_loss, ref_loss, rel_increase))
+    if new_issues:
+        print("\nEdges with significant increase vs temporal reference:")
+        for u, v, c, r, ri in new_issues:
+            print(f" {u}->{v} | curr_loss={c:.1f} | ref_loss={r:.1f} | rel_increase={ri:.2f}")
+
+    # 7) visualize current period graph with leakage highlight
+    plot_graph_leakage(pg_curr, top_n_edges=15)
+
+    return pg_prev, pg_curr, ref, top_leaks
+
+
+if __name__ == "__main__":
+    demo_pipeline()
